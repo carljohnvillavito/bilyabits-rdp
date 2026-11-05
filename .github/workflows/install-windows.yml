@@ -1,0 +1,224 @@
+name: Windows RDP Debug
+
+on:
+  workflow_dispatch:
+    inputs:
+      phone_tailscale_ip:
+        description: Your phone's Tailscale IPv4 address (100.x.x.x)
+        required: true
+        type: string
+      session_minutes:
+        description: Minutes of desktop time (5–360, subject to the job limit)
+        required: true
+        default: '30'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-rdp-debug
+  cancel-in-progress: false
+
+jobs:
+  desktop:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check connection settings
+        env:
+          PHONE_IP: ${{ inputs.phone_tailscale_ip }}
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          $phoneInput = ([string]$env:PHONE_IP).Trim()
+          $phoneIP = $null
+          if (-not [ipaddress]::TryParse($phoneInput, [ref]$phoneIP) -or
+              $phoneIP.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+              $phoneIP.ToString() -ne $phoneInput) {
+            throw 'Enter the dotted IPv4 address shown for this phone in Tailscale.'
+          }
+          $octets = $phoneIP.GetAddressBytes()
+          if ($octets[0] -ne 100 -or $octets[1] -lt 64 -or $octets[1] -gt 127) {
+            throw 'Use a phone Tailscale IPv4 address from the 100.64.0.0/10 range.'
+          }
+
+          $minutes = 0
+          if (-not [int]::TryParse($env:SESSION_MINUTES, [ref]$minutes) -or
+              $minutes -lt 5 -or $minutes -gt 360) {
+            throw 'Enter a whole number from 5 to 360 for session_minutes.'
+          }
+
+          # Leave time for cleanup before GitHub enforces the job timeout.
+          $jobDeadline = [DateTimeOffset]::UtcNow.AddMinutes(355)
+          "RDP_JOB_DEADLINE=$($jobDeadline.ToString('o'))" >> $env:GITHUB_ENV
+          "RDP_PHONE_IP=$phoneIP" >> $env:GITHUB_ENV
+          "RDP_SESSION_MINUTES=$minutes" >> $env:GITHUB_ENV
+
+      - name: Check out the project
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Tailscale
+        timeout-minutes: 5
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'tailscale-amd64.msi'
+          $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.104.5-amd64.msi'
+          Invoke-WebRequest -Uri $url -OutFile $msi -TimeoutSec 90
+          $signature = Get-AuthenticodeSignature -FilePath $msi
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '\bTailscale\b') {
+            throw "Tailscale installer signature verification failed ($($signature.Status))."
+          }
+
+          $installer = Start-Process -FilePath 'msiexec.exe' -Wait -PassThru -ArgumentList @(
+            '/i', ('"{0}"' -f $msi), '/qn', '/norestart', 'TS_NOLAUNCH=1'
+          )
+          if ($installer.ExitCode -ne 0) {
+            throw "Tailscale installer exited with code $($installer.ExitCode)."
+          }
+          Remove-Item -LiteralPath $msi
+          $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (-not (Test-Path -LiteralPath $tailscale -PathType Leaf)) {
+            throw 'Tailscale was not found after installation.'
+          }
+
+      - name: Enable private RDP
+        timeout-minutes: 5
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw 'Set the TAILSCALE_AUTHKEY repository secret before running this workflow.'
+          }
+
+          $password = $env:RDP_PASSWORD
+          if ($password.Length -lt 20 -or $password.Length -gt 127 -or
+              $password -cnotmatch '[A-Z]' -or $password -cnotmatch '[a-z]' -or
+              $password -notmatch '[0-9]' -or $password -notmatch '[^A-Za-z0-9\s]' -or
+              $password -match 'rdpdebug') {
+            throw 'Set RDP_PASSWORD to 20–127 characters with upper and lowercase letters, a number, and a symbol. Avoid rdpdebug in the password.'
+          }
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          Remove-Item Env:RDP_PASSWORD
+          Remove-Variable password
+
+          $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          Start-Service -Name Tailscale
+          $keyFile = Join-Path $env:RUNNER_TEMP ("rdp-tailnet-{0}.key" -f [guid]::NewGuid())
+          try {
+            [System.IO.File]::WriteAllText($keyFile, $env:TAILSCALE_AUTHKEY.Trim())
+            Remove-Item Env:TAILSCALE_AUTHKEY
+            $hostname = "gh-rdp-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+            & $tailscale up "--auth-key=file:$keyFile" --unattended --accept-dns=false --accept-routes=false --shields-up=false "--hostname=$hostname" --timeout=90s
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Tailscale sign-in failed. Check that your key is valid and the device is approved if your tailnet requires it.'
+            }
+          } finally {
+            Remove-Item -LiteralPath $keyFile -Force -ErrorAction SilentlyContinue
+          }
+
+          $addresses = & $tailscale ip -4
+          if ($LASTEXITCODE -ne 0 -or -not $addresses) {
+            throw 'Tailscale did not assign a runner IPv4 address.'
+          }
+          $runnerIP = ([string]($addresses | Select-Object -First 1)).Trim()
+          $adapterDeadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
+          do {
+            $adapter = Get-NetIPAddress -IPAddress $runnerIP -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($adapter) { break }
+            Start-Sleep -Seconds 2
+          } while ([DateTimeOffset]::UtcNow -lt $adapterDeadline)
+          if (-not $adapter) {
+            throw 'The Tailscale network adapter did not come online.'
+          }
+
+          $rdpUser = New-LocalUser -Name 'rdpdebug' -Password $securePassword -Description 'Temporary Windows project debugging account'
+          Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $rdpUser
+          Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $rdpUser
+
+          # Scope the sole RDP allow rule to the phone and Tailscale interface.
+          Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True -DefaultInboundAction Block
+          Get-NetFirewallRule -Name 'RemoteDesktop*' -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+          $firewallRule = @{
+            Name = 'ProjectDebugRdp'
+            DisplayName = 'Project Debug RDP (Tailscale phone)'
+            Direction = 'Inbound'
+            Action = 'Allow'
+            Profile = 'Any'
+            Protocol = 'TCP'
+            LocalPort = 3389
+            InterfaceAlias = $adapter.InterfaceAlias
+            LocalAddress = $runnerIP
+            RemoteAddress = $env:RDP_PHONE_IP
+          }
+          New-NetFirewallRule @firewallRule | Out-Null
+
+          $terminalServer = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty -LiteralPath "$terminalServer\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1
+          Set-ItemProperty -LiteralPath $terminalServer -Name fDenyTSConnections -Value 0
+          Restart-Service -Name TermService -Force
+
+          $listenerDeadline = [DateTimeOffset]::UtcNow.AddSeconds(45)
+          while (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
+            if ([DateTimeOffset]::UtcNow -ge $listenerDeadline) {
+              throw 'Remote Desktop Services did not open TCP 3389.'
+            }
+            Start-Sleep -Seconds 2
+          }
+          "RDP_RUNNER_IP=$runnerIP" >> $env:GITHUB_ENV
+
+      - name: Show connection details and hold session
+        run: |
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes([int]$env:RDP_SESSION_MINUTES)
+          $jobDeadline = [DateTimeOffset]::Parse($env:RDP_JOB_DEADLINE)
+          if ($deadline -gt $jobDeadline) {
+            $deadline = $jobDeadline
+          }
+          $username = "$env:COMPUTERNAME\rdpdebug"
+          $expires = $deadline.ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
+
+          @"
+          ### Windows RDP is ready
+
+          | Field | Value |
+          | --- | --- |
+          | PC address | $($env:RDP_RUNNER_IP):3389 |
+          | Username | $username |
+          | Password | Your RDP_PASSWORD repository secret |
+          | Scheduled end | $expires |
+          | Project folder | $env:GITHUB_WORKSPACE |
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+          Write-Host "PC address: $($env:RDP_RUNNER_IP):3389"
+          Write-Host "Username: $username"
+          Write-Host "Scheduled end: $expires"
+          Write-Host "Project folder: $env:GITHUB_WORKSPACE"
+          Write-Host 'Keep Tailscale connected on the phone. Cancel this run when finished.'
+
+          while ([DateTimeOffset]::UtcNow -lt $deadline) {
+            Start-Sleep -Seconds 5
+          }
+
+      - name: Close RDP and sign out of Tailscale
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          Remove-NetFirewallRule -Name 'ProjectDebugRdp' -ErrorAction SilentlyContinue
+          if (Get-LocalUser -Name 'rdpdebug' -ErrorAction SilentlyContinue) {
+            Disable-LocalUser -Name 'rdpdebug' -ErrorAction SilentlyContinue
+          }
+          $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (Test-Path -LiteralPath $tailscale -PathType Leaf) {
+            & $tailscale logout
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning 'Tailscale logout did not complete. The ephemeral node expires after the VM goes offline.'
+            }
+          }
+          exit 0
